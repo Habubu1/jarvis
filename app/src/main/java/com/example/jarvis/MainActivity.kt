@@ -16,6 +16,7 @@ import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.ContactsContract
 import android.provider.MediaStore
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -45,9 +46,25 @@ class MainActivity : Activity() {
             "You are Jarvis, a voice assistant that controls the user's Android phone. " +
             "The user speaks English, Hindi or Hinglish. Reply in 1-2 short sentences. " +
             "If the user speaks Hindi or Hinglish, reply in Hindi (Devanagari). " +
-            "For any phone action use the tools. To open any app, always call open_app " +
+            "For any phone action use the tools. To only open an app call open_app " +
             "with the app name; the phone decides whether it is installed. " +
-            "To play a song call play_music. Never say you cannot open apps."
+            "To send a WhatsApp or SMS message call send_message with the contact name and the message text. " +
+            "For anything INSIDE an app (search in Instagram, play a song in Spotify, scroll, like, " +
+            "open a chat, settings inside an app) call phone_task with a clear goal sentence in English, " +
+            "for example: In Spotify search for Chanda Mere and play the first song result. " +
+            "Never use tools for payments, passwords or OTPs. Never say you cannot open apps."
+
+        const val AGENT_PROMPT = """You control an Android phone through its accessibility tree.
+You get the GOAL, your ACTIONS SO FAR and the current SCREEN as lines: index|flags|text.
+Reply with ONE JSON object only, no other text. Allowed actions:
+{"action":"open_app","name":"Instagram"}
+{"action":"click","index":3}
+{"action":"type","index":2,"text":"hello"}
+{"action":"scroll","dir":"down"}
+{"action":"back"}
+{"action":"wait"}
+{"action":"done","result":"one short sentence for the user"}
+Rules: if the app of the goal is not on screen, use open_app first. To search: click the search icon or tab, then click the search field, type the query, then click the matching result or suggestion. To play a song: search it, then click the first song result. Finish with done as soon as the goal is achieved or impossible. Never enter passwords, OTPs or payment details, never send money, and never delete or post anything unless the goal clearly asks for it; in that case finish with done and tell the user."""
     }
 
     private lateinit var prefs: android.content.SharedPreferences
@@ -145,6 +162,12 @@ class MainActivity : Activity() {
                 cmdInput.setText("")
                 handle(t)
             }
+        }
+
+        val accBtn = Button(this).apply { text = "Accessibility settings kholo" }
+        root.addView(accBtn)
+        accBtn.setOnClickListener {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
 
         micBtn = Button(this).apply {
@@ -372,7 +395,7 @@ class MainActivity : Activity() {
             .put(
                 tool(
                     "search",
-                    "Search inside an app: youtube, spotify, instagram (exact username), maps; anything else searches Google",
+                    "Open a search page for youtube, maps or Google only. For searching inside Instagram, Spotify or other apps use phone_task instead.",
                     JSONObject().put("app", p("string")).put("query", p("string")),
                     listOf("app", "query")
                 )
@@ -380,9 +403,28 @@ class MainActivity : Activity() {
             .put(
                 tool(
                     "play_music",
-                    "Play a song or artist. app is optional (for example spotify or youtube music).",
+                    "Fallback only: ask the music app to play a song. Prefer phone_task for Spotify or YouTube.",
                     JSONObject().put("query", p("string")).put("app", p("string")),
                     listOf("query")
+                )
+            )
+            .put(
+                tool(
+                    "send_message",
+                    "Send a WhatsApp message (default) or SMS to a saved contact name or phone number.",
+                    JSONObject()
+                        .put("to", p("string"))
+                        .put("text", p("string"))
+                        .put("app", p("string")),
+                    listOf("to", "text")
+                )
+            )
+            .put(
+                tool(
+                    "phone_task",
+                    "Do something inside any app by looking at the screen and tapping/typing, for example: In Instagram search for priyankachopra; In Spotify search for a song and play the first result.",
+                    JSONObject().put("goal", p("string")),
+                    listOf("goal")
                 )
             )
     }
@@ -398,6 +440,8 @@ class MainActivity : Activity() {
                 "alarm" -> alarm(a.optInt("hour"), a.optInt("minute"))
                 "search" -> search(a.optString("app"), a.optString("query"))
                 "play_music" -> playMusic(a.optString("query"), a.optString("app"))
+                "send_message" -> sendMessage(a.optString("to"), a.optString("text"), a.optString("app"))
+                "phone_task" -> phoneTask(a.optString("goal"))
                 else -> "Ye kaam abhi nahi aata"
             }
         } catch (e: Exception) {
@@ -573,5 +617,104 @@ class MainActivity : Activity() {
             openUrl("https://www.youtube.com/results?search_query=" + enc(query))
             "Music app nahi mila, YouTube par $query khol raha hoon"
         }
+    }
+
+    // --- messages: WhatsApp / SMS
+
+    private fun sendMessage(to: String, text: String, app: String): String {
+        val raw = if (to.count { it.isDigit() } >= 7) to else contactNumber(to)
+            ?: return "$to naam ka contact nahi mila"
+        var num = raw.filter { it.isDigit() }.trimStart('0')
+        if (num.length == 10) num = "91$num"
+        val a = norm(app)
+        val sms = a == "sms" || a == "messages" || a == "text"
+
+        if (sms) {
+            startActivity(
+                Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$num"))
+                    .putExtra("sms_body", text)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } else {
+            openUrl("https://wa.me/$num?text=" + enc(text), "whatsapp")
+        }
+
+        val svc = JarvisAccessibilityService.instance
+            ?: return "Message likh diya hai, bas Send dabao. Auto-send ke liye Accessibility ON karo."
+        repeat(10) {
+            Thread.sleep(1000)
+            if (svc.clickSend()) return "$to ko message bhej diya"
+        }
+        return "Message taiyar hai par Send button nahi mila, khud dabao"
+    }
+
+    // --- general agent: look at the screen, tap / type / scroll inside any app
+
+    private fun phoneTask(goal: String): String {
+        val svc = JarvisAccessibilityService.instance
+        if (svc == null) {
+            runOnUiThread { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+            return "Pehle Accessibility mein Jarvis ko ON karo, maine settings khol di hain"
+        }
+        val key = savedKey()
+        val done = ArrayList<String>()
+        repeat(15) {
+            Thread.sleep(1800)
+            val screen = svc.snapshot()
+            val prompt = "GOAL: $goal\nACTIONS SO FAR: " + done.takeLast(8).joinToString("; ") +
+                "\nSCREEN:\n" + screen
+            val msgs = JSONArray()
+                .put(JSONObject().put("role", "system").put("content", AGENT_PROMPT))
+                .put(JSONObject().put("role", "user").put("content", prompt))
+            val res = post(
+                JSONObject().put("model", MODEL).put("messages", msgs).put("temperature", 0.2),
+                key
+            )
+            if (!res.has("choices")) return "Groq error aa gaya"
+            val c = res.getJSONArray("choices").getJSONObject(0)
+                .getJSONObject("message").optString("content", "")
+            val s = c.indexOf('{')
+            val e = c.lastIndexOf('}')
+            if (s < 0 || e <= s) {
+                done.add("bad reply")
+                return@repeat
+            }
+            val act = try {
+                JSONObject(c.substring(s, e + 1))
+            } catch (ex: Exception) {
+                done.add("bad json")
+                return@repeat
+            }
+            when (act.optString("action")) {
+                "done" -> return act.optString("result", "Ho gaya")
+                "open_app" -> {
+                    val n = act.optString("name")
+                    done.add("open $n")
+                    openApp(n)
+                }
+                "click" -> {
+                    val i = act.optInt("index", -1)
+                    done.add("click $i " + svc.label(i))
+                    svc.clickIndex(i)
+                }
+                "type" -> {
+                    val i = act.optInt("index", -1)
+                    val t = act.optString("text")
+                    done.add("type '$t' in $i")
+                    svc.setText(i, t)
+                }
+                "scroll" -> {
+                    val down = act.optString("dir") != "up"
+                    done.add("scroll " + (if (down) "down" else "up"))
+                    svc.scroll(down)
+                }
+                "back" -> {
+                    done.add("back")
+                    svc.back()
+                }
+                else -> done.add("wait")
+            }
+        }
+        return "Kaam poora nahi ho paya, 15 steps ho gaye"
     }
 }
