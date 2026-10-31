@@ -407,8 +407,21 @@ class MainActivity : Activity() {
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
-    private fun openUrl(url: String) {
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    private fun openUrl(url: String, appName: String = "") {
+        val i = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (appName.isNotBlank()) {
+            val r = findApp(appName)
+            if (r != null) {
+                i.setPackage(r.activityInfo.packageName)
+                try {
+                    startActivity(i)
+                    return
+                } catch (e: Exception) {
+                    i.setPackage(null)
+                }
+            }
+        }
+        startActivity(i)
     }
 
     // --- app list knowledge: the phone's own list of installed apps
@@ -541,7 +554,7 @@ class MainActivity : Activity() {
             a.contains("map") -> "geo:0,0?q=$q"
             else -> "https://www.google.com/search?q=$q"
         }
-        openUrl(link)
+        openUrl(link, app)
         return "$app par $query khol raha hoon"
     }
 
